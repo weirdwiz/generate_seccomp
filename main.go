@@ -1,86 +1,75 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"os"
-	"os/exec"
-	"syscall"
+	"strconv"
+	"time"
 
-	"github.com/docker/docker/api/types"
-	sec "github.com/seccomp/libseccomp-golang"
+	"github.com/coreos/go-systemd/sdjournal"
 )
 
+type syscallRequest struct {
+	syscallNo int64
+	pid       int64
+	uid       int64
+	gid       int64
+}
+
 func main() {
-	var regs syscall.PtraceRegs
-	scalls := make(calls, 303)
-	scalls.init()
+	c := make(chan syscallRequest)
+	go readJournal(c)
 
-	cmd := exec.Command(os.Args[1], os.Args[2:]...)
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Ptrace: true,
-	}
+}
 
-	cmd.Start()
-	err := cmd.Wait()
+func readJournal(c chan syscallRequest) {
+	j, err := sdjournal.NewJournal()
+	defer j.Close()
 	if err != nil {
 		fmt.Println(err)
 	}
-	pid := cmd.Process.Pid
-	exit := true
-	for {
-		if exit {
-			err = syscall.PtraceGetRegs(pid, &regs)
-			if err != nil {
-				break
-			}
-			scalls[getName(regs.Orig_rax)] = true
-		}
-
-		err = syscall.PtraceSyscall(pid, 0)
-		if err != nil {
-			panic(err)
-		}
-		_, err := syscall.Wait4(pid, nil, 0, nil)
-		if err != nil {
-			panic(err)
-		}
-		exit = !exit
+	err = j.AddMatch("_AUDIT_TYPE_NAME=SECCOMP")
+	if err := j.SeekRealtimeUsec(uint64(time.Now().UnixNano() / 1000)); err != nil {
+		fmt.Println("can't seek")
 	}
-	generateProfile(scalls)
-}
 
-func getName(id uint64) string {
-	name, _ := sec.ScmpSyscall(id).GetName()
-	return name
-}
-
-func generateProfile(c calls) {
-	s := types.Seccomp{}
-	b, _ := ioutil.ReadFile("default.json")
-	json.Unmarshal(b, &s)
-	var names []string
-	for s, t := range c {
-		if t {
-			names = append(names, s)
-		}
+	if _, err := j.Next(); err != nil {
+		fmt.Println(err)
 	}
-	s.Syscalls = []*types.Syscall{
-		&types.Syscall{
-			Action: types.ActAllow,
-			Names:  names,
-			Args:   []*types.Arg{},
-		},
-	}
-	sJSON, _ := json.Marshal(s)
-
-	err := ioutil.WriteFile("output.json", sJSON, 0644)
+	prevCursor, err := j.GetCursor()
 	if err != nil {
-		panic(err)
+		fmt.Println(err)
 	}
+	for {
+		if _, err := j.Next(); err != nil {
+			fmt.Println(err)
+		}
+		newCursor, err := j.GetCursor()
+		if err != nil {
+			fmt.Println(err)
+		}
+		if prevCursor == newCursor {
+			_ = j.Wait(sdjournal.IndefiniteWait)
+			continue
+		}
+		prevCursor = newCursor
+		entry, err := j.GetEntry()
+		if err != nil {
+			fmt.Println(err)
+		}
+		c <- convertToSyscallRequest(entry)
+	}
+}
 
+func convertToSyscallRequest(entry *sdjournal.JournalEntry) syscallRequest {
+	uid, _ := strconv.ParseInt(entry.Fields["_UID"], 10, 64)
+	gid, _ := strconv.ParseInt(entry.Fields["_GID"], 10, 64)
+	pid, _ := strconv.ParseInt(entry.Fields["_PID"], 10, 64)
+	sNo, _ := strconv.ParseInt(entry.Fields["_AUDIT_FIELD_SYSCALL"], 10, 64)
+	s := syscallRequest{
+		syscallNo: sNo,
+		pid:       pid,
+		gid:       gid,
+		uid:       uid,
+	}
+	return s
 }
